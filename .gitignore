@@ -1,0 +1,19 @@
+/target/
+**/*.rs.bk
+Cargo.lock
+deploy.bat
+
+# Credentials & secrets
+.env
+*.pem
+*.key
+*.json
+
+# Binaries & Archives
+/dist/
+*.exe
+cloud-uploader
+tmp_downloads/
+*.zip
+*.tar.gz
+*.log
