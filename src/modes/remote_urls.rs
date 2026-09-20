@@ -1,6 +1,7 @@
 use crate::client::{build_http_client, retry_request, stream_download_to_file};
 use crate::storage::{RemoteFileInfo, StorageProvider};
 use crate::utils::hash::compute_md5_file;
+use crate::utils::path::normalize_remote_dir;
 use anyhow::{bail, Context, Result};
 use regex::Regex;
 use reqwest::header::{AUTHORIZATION, USER_AGENT};
@@ -50,10 +51,11 @@ pub async fn run_remote_urls(
     remote_base_dir: &str,
     urls_file_override: Option<&std::path::Path>,
 ) -> Result<()> {
-    let clean_base = if remote_base_dir.is_empty() || remote_base_dir == "/" {
+    let clean_base = normalize_remote_dir(remote_base_dir);
+    let clean_base = if clean_base == "/" {
         "/Upload".to_string()
     } else {
-        format!("/{}", remote_base_dir.trim_matches('/'))
+        clean_base
     };
 
     // 1. Resolve URLs list source (explicit path -> local next to exe/cwd -> cloud)
@@ -316,11 +318,14 @@ async fn fetch_latest_github_assets(
 ) -> Result<(Vec<DownloadTask>, String)> {
     let mut req = client.get(api_url);
 
-    // Set User-Agent as required by GitHub API
-    req = req.header(
-        USER_AGENT,
-        "cloud-uploader/1.0 (+https://github.com/cloud-uploader)",
-    );
+    // Set User-Agent, Accept and API Version as recommended by GitHub API
+    req = req
+        .header(
+            USER_AGENT,
+            "cloud-uploader/1.0 (+https://github.com/cloud-uploader)",
+        )
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28");
 
     // Support GITHUB_TOKEN for 5000 req/hour rate limit
     if let Ok(gh_token) = env::var("GITHUB_TOKEN") {
@@ -456,5 +461,82 @@ mod tests {
 
         // When updating "myapp.apk", "notes.txt" does not match asset_base_name!
         assert_ne!(&caps_user[2], "myapp.apk");
+    }
+
+    struct MockDeleteProvider {
+        deleted: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageProvider for MockDeleteProvider {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+        async fn ensure_dir(&self, _d: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn upload_file(&self, _l: &std::path::Path, _r: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn get_file_info(&self, _r: &str) -> Result<Option<RemoteFileInfo>> {
+            Ok(None)
+        }
+        async fn delete_file(&self, r: &str) -> Result<()> {
+            self.deleted.lock().unwrap().push(r.to_string());
+            Ok(())
+        }
+        async fn read_text_file(&self, _r: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn list_dir(&self, _d: &str) -> Result<Vec<RemoteFileInfo>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_safe_clean_old_versions_deletes_only_stale_managed_assets() {
+        let items = vec![
+            RemoteFileInfo {
+                name: "[v1.0] app.apk".to_string(),
+                path: "/Upload/repo/[v1.0] app.apk".to_string(),
+                is_dir: false,
+                size: 100,
+                md5: None,
+                etag: None,
+                last_modified: None,
+            },
+            RemoteFileInfo {
+                name: "[v2.0] app.apk".to_string(),
+                path: "/Upload/repo/[v2.0] app.apk".to_string(),
+                is_dir: false,
+                size: 100,
+                md5: None,
+                etag: None,
+                last_modified: None,
+            },
+            RemoteFileInfo {
+                name: "[draft] notes.txt".to_string(),
+                path: "/Upload/repo/[draft] notes.txt".to_string(),
+                is_dir: false,
+                size: 50,
+                md5: None,
+                etag: None,
+                last_modified: None,
+            },
+        ];
+
+        let provider = MockDeleteProvider {
+            deleted: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let (exists, remaining) =
+            safe_clean_old_versions(&provider, "v2.0", "app.apk", items).await;
+
+        assert!(exists, "v2.0 should be marked as existing");
+        let deleted = provider.deleted.lock().unwrap().clone();
+        assert_eq!(deleted, vec!["/Upload/repo/[v1.0] app.apk"]);
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().any(|r| r.name == "[v2.0] app.apk"));
+        assert!(remaining.iter().any(|r| r.name == "[draft] notes.txt"));
     }
 }

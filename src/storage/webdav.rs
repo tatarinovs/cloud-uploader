@@ -15,6 +15,7 @@ pub struct WebDavProvider {
     base_url: String,
     user: String,
     password: String,
+    trust_etag_as_md5: bool,
     client: Client,
 }
 
@@ -25,11 +26,22 @@ impl WebDavProvider {
         user: String,
         password: String,
     ) -> Result<Self> {
+        Self::new_with_etag_option(display_name, base_url, user, password, true)
+    }
+
+    pub fn new_with_etag_option(
+        display_name: &'static str,
+        base_url: String,
+        user: String,
+        password: String,
+        trust_etag_as_md5: bool,
+    ) -> Result<Self> {
         Ok(Self {
             display_name,
             base_url: base_url.trim_end_matches('/').to_string(),
             user,
             password,
+            trust_etag_as_md5,
             client: build_http_client(Some(Duration::from_secs(600)))?,
         })
     }
@@ -71,6 +83,8 @@ struct DavProp {
     getcontentlength: Option<String>,
     #[serde(default)]
     getetag: Option<String>,
+    #[serde(default)]
+    getlastmodified: Option<String>,
     resourcetype: Option<DavResourceType>,
 }
 
@@ -144,6 +158,7 @@ impl StorageProvider for WebDavProvider {
   <D:prop>
     <D:getcontentlength/>
     <D:getetag/>
+    <D:getlastmodified/>
     <D:resourcetype/>
   </D:prop>
 </D:propfind>"#;
@@ -205,7 +220,16 @@ impl StorageProvider for WebDavProvider {
             .getetag
             .as_deref()
             .map(|s| s.trim_matches('"').to_string());
-        let md5 = parse_etag_md5(etag.as_deref());
+        let md5 = if self.trust_etag_as_md5 {
+            parse_etag_md5(etag.as_deref())
+        } else {
+            None
+        };
+        let last_modified = prop
+            .getlastmodified
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc2822(s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
         let name = remote_path.rsplit('/').next().unwrap_or("").to_string();
 
         Ok(Some(RemoteFileInfo {
@@ -215,6 +239,7 @@ impl StorageProvider for WebDavProvider {
             size,
             md5,
             etag,
+            last_modified,
         }))
     }
 
@@ -328,6 +353,7 @@ impl StorageProvider for WebDavProvider {
     <D:getcontentlength/>
     <D:resourcetype/>
     <D:getetag/>
+    <D:getlastmodified/>
   </D:prop>
 </D:propfind>"#;
 
@@ -398,7 +424,15 @@ impl StorageProvider for WebDavProvider {
                 let etag = prop
                     .and_then(|p| p.getetag.as_deref())
                     .map(|s| s.trim_matches('"').to_string());
-                let md5 = parse_etag_md5(etag.as_deref());
+                let md5 = if self.trust_etag_as_md5 {
+                    parse_etag_md5(etag.as_deref())
+                } else {
+                    None
+                };
+                let last_modified = prop
+                    .and_then(|p| p.getlastmodified.as_deref())
+                    .and_then(|s| chrono::DateTime::parse_from_rfc2822(s).ok())
+                    .map(|dt| dt.with_timezone(&chrono::Utc));
 
                 Some(RemoteFileInfo {
                     name,
@@ -407,6 +441,7 @@ impl StorageProvider for WebDavProvider {
                     size,
                     md5,
                     etag,
+                    last_modified,
                 })
             })
             .collect();

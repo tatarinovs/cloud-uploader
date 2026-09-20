@@ -1,4 +1,4 @@
-﻿pub mod google;
+pub mod google;
 pub mod mailru;
 pub mod s3;
 pub mod webdav;
@@ -17,6 +17,7 @@ pub struct RemoteFileInfo {
     pub md5: Option<String>,
     #[allow(dead_code)]
     pub etag: Option<String>,
+    pub last_modified: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[async_trait]

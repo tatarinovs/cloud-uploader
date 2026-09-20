@@ -8,11 +8,12 @@ pub struct MailRuProvider {
 impl MailRuProvider {
     pub fn new(user: String, password: String) -> Result<Self> {
         Ok(Self {
-            inner: WebDavProvider::new(
+            inner: WebDavProvider::new_with_etag_option(
                 "Mail.ru Cloud (WebDAV)",
                 "https://webdav.mail.ru".to_string(),
                 user,
                 password,
+                false, // Mail.ru WebDAV ETag is an internal revision tag, not MD5
             )?,
         })
     }

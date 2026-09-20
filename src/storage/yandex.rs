@@ -49,6 +49,7 @@ struct YaResourceResponse {
     item_type: Option<String>,
     size: Option<i64>,
     md5: Option<String>,
+    modified: Option<String>,
     _embedded: Option<YaEmbedded>,
 }
 
@@ -66,6 +67,7 @@ struct YaResourceItem {
     #[serde(default)]
     size: i64,
     md5: Option<String>,
+    modified: Option<String>,
 }
 
 #[async_trait]
@@ -159,6 +161,12 @@ impl StorageProvider for YandexDiskProvider {
             .context("Failed to parse Yandex Disk resource JSON")?;
         let is_dir = ya_res.item_type.as_deref() == Some("dir");
 
+        let last_modified = ya_res
+            .modified
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+
         Ok(Some(RemoteFileInfo {
             name: ya_res
                 .name
@@ -168,6 +176,7 @@ impl StorageProvider for YandexDiskProvider {
             size: ya_res.size.unwrap_or(0),
             md5: ya_res.md5,
             etag: None,
+            last_modified,
         }))
     }
 
@@ -360,13 +369,21 @@ impl StorageProvider for YandexDiskProvider {
                 embedded
                     .items
                     .into_iter()
-                    .map(|item| RemoteFileInfo {
-                        is_dir: item.item_type == "dir",
-                        name: item.name,
-                        path: item.path,
-                        size: item.size,
-                        md5: item.md5,
-                        etag: None,
+                    .map(|item| {
+                        let last_modified = item
+                            .modified
+                            .as_deref()
+                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                            .map(|dt| dt.with_timezone(&chrono::Utc));
+                        RemoteFileInfo {
+                            is_dir: item.item_type == "dir",
+                            name: item.name,
+                            path: item.path,
+                            size: item.size,
+                            md5: item.md5,
+                            etag: None,
+                            last_modified,
+                        }
                     })
                     .collect()
             })

@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "cloud-uploader"
 version = "1.0.0"
 edition = "2021"
@@ -27,6 +27,9 @@ anyhow = "1.0"
 regex = "1.10"
 futures-util = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 codegen-units = 1

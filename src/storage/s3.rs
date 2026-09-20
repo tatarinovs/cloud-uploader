@@ -138,6 +138,8 @@ struct S3Object {
     size: i64,
     #[serde(rename = "ETag", default)]
     etag: Option<String>,
+    #[serde(rename = "LastModified", default)]
+    last_modified: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,6 +240,12 @@ impl StorageProvider for S3Provider {
             }
         });
 
+        let last_modified = headers
+            .get(reqwest::header::LAST_MODIFIED)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| chrono::DateTime::parse_from_rfc2822(s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+
         let name = remote_path.rsplit('/').next().unwrap_or("").to_string();
 
         Ok(Some(RemoteFileInfo {
@@ -247,6 +255,7 @@ impl StorageProvider for S3Provider {
             size,
             md5,
             etag,
+            last_modified,
         }))
     }
 
@@ -410,6 +419,7 @@ impl StorageProvider for S3Provider {
                 size: 0,
                 md5: None,
                 etag: None,
+                last_modified: None,
             }
         });
 
@@ -425,6 +435,12 @@ impl StorageProvider for S3Provider {
                 .filter(|e| e.len() == 32 && !e.contains('-'))
                 .cloned();
 
+            let last_modified = obj
+                .last_modified
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc));
+
             Some(RemoteFileInfo {
                 name: obj_key.rsplit('/').next().unwrap_or("").to_string(),
                 path: format!("/{}", obj_key),
@@ -432,6 +448,7 @@ impl StorageProvider for S3Provider {
                 size: obj.size,
                 md5,
                 etag,
+                last_modified,
             })
         });
 

@@ -160,7 +160,7 @@ impl GoogleDriveProvider {
             parent_id, file_name
         );
         let url = format!(
-            "{}?q={}&fields=files(id,name,size,mimeType,md5Checksum,parents)&pageSize=1",
+            "{}?q={}&fields=files(id,name,size,mimeType,md5Checksum,modifiedTime,parents)&pageSize=1",
             GDRIVE_FILES_API,
             urlencoding_encode(&q)
         );
@@ -213,6 +213,8 @@ pub struct GDriveFileItem {
     pub mime_type: Option<String>,
     #[serde(rename = "md5Checksum")]
     pub md5_checksum: Option<String>,
+    #[serde(rename = "modifiedTime")]
+    pub modified_time: Option<String>,
 }
 
 #[async_trait]
@@ -243,6 +245,11 @@ impl StorageProvider for GoogleDriveProvider {
             Some(f) => {
                 let is_dir = f.mime_type.as_deref() == Some("application/vnd.google-apps.folder");
                 let size = f.size.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                let last_modified = f
+                    .modified_time
+                    .as_deref()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&chrono::Utc));
                 Ok(Some(RemoteFileInfo {
                     name: f.name,
                     path: format!("/{}", clean),
@@ -250,6 +257,7 @@ impl StorageProvider for GoogleDriveProvider {
                     size,
                     md5: f.md5_checksum,
                     etag: None,
+                    last_modified,
                 }))
             }
             None => Ok(None),
@@ -430,7 +438,7 @@ impl StorageProvider for GoogleDriveProvider {
 
         let q = format!("'{}' in parents and trashed = false", folder_id);
         let url = format!(
-            "{}?q={}&fields=files(id,name,size,mimeType,md5Checksum)&pageSize=1000",
+            "{}?q={}&fields=files(id,name,size,mimeType,md5Checksum,modifiedTime)&pageSize=1000",
             GDRIVE_FILES_API,
             urlencoding_encode(&q)
         );
@@ -467,6 +475,12 @@ impl StorageProvider for GoogleDriveProvider {
                     format!("/{}/{}", clean, f.name)
                 };
 
+                let last_modified = f
+                    .modified_time
+                    .as_deref()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&chrono::Utc));
+
                 RemoteFileInfo {
                     name: f.name,
                     path,
@@ -474,6 +488,7 @@ impl StorageProvider for GoogleDriveProvider {
                     size,
                     md5: f.md5_checksum,
                     etag: None,
+                    last_modified,
                 }
             })
             .collect();

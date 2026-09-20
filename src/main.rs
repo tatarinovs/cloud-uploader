@@ -170,11 +170,12 @@ async fn main() -> Result<()> {
         bail!("Environment loading error: {}", e);
     }
 
-    // Clean remote path
-    let remote_dir = if cli.remote.trim().is_empty() || cli.remote.trim() == "/" {
+    // Clean remote path safely resolving any .. segments
+    let remote_dir = crate::utils::path::normalize_remote_dir(&cli.remote);
+    let remote_dir = if remote_dir == "/" {
         "/Upload".to_string()
     } else {
-        format!("/{}", cli.remote.trim().trim_matches('/'))
+        remote_dir
     };
 
     // 3. Initialize cloud provider
