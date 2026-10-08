@@ -4,23 +4,19 @@ use std::path::Path;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 
-pub async fn compute_md5_file<P: AsRef<Path>>(path: P) -> Result<String> {
-    let path_ref = path.as_ref();
-    let mut file = File::open(path_ref).await.with_context(|| {
-        format!(
-            "Failed to open file for MD5 computation: {}",
-            path_ref.display()
-        )
-    })?;
+/// Streams a file through MD5 and returns the lowercase hex digest.
+pub async fn compute_md5_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path)
+        .await
+        .with_context(|| format!("Failed to open '{}' for hashing", path.display()))?;
 
     let mut hasher = Md5::new();
-    let mut buffer = [0u8; 65536];
-
+    let mut buffer = vec![0u8; 1 << 20];
     loop {
         let n = file
             .read(&mut buffer)
             .await
-            .with_context(|| format!("Failed to read chunk from file: {}", path_ref.display()))?;
+            .with_context(|| format!("Failed to read '{}'", path.display()))?;
         if n == 0 {
             break;
         }

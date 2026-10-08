@@ -1,19 +1,56 @@
+# ------------------------------------------------------------------------------
+# Rust build output
+# ------------------------------------------------------------------------------
 /target/
 **/*.rs.bk
-Cargo.lock
-deploy.bat
+*.pdb
 
-# Credentials & secrets
+# Cargo.lock is intentionally committed: this is a binary, builds must be reproducible.
+
+# ------------------------------------------------------------------------------
+# Secrets: never commit credentials
+# ------------------------------------------------------------------------------
 .env
+.env.*
+*.env
+!.env.example
 *.pem
 *.key
-*.json
+*.p12
+*.pfx
+client_secret*.json
+credentials*.json
+service-account*.json
+token*.json
 
-# Binaries & Archives
+# ------------------------------------------------------------------------------
+# Release artifacts and local deployment
+# ------------------------------------------------------------------------------
 /dist/
 *.exe
-cloud-uploader
-tmp_downloads/
+/cloud-uploader
+/cloud-uploader-linux-*
 *.zip
 *.tar.gz
+*.7z
+deploy.bat
+deploy.sh
+
+# ------------------------------------------------------------------------------
+# Runtime data (local URL list, temp downloads, logs)
+# ------------------------------------------------------------------------------
+/urls.txt
+tmp_downloads/
 *.log
+
+# ------------------------------------------------------------------------------
+# Editors and OS
+# ------------------------------------------------------------------------------
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

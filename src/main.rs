@@ -4,259 +4,308 @@ mod modes;
 mod storage;
 mod utils;
 
-use anyhow::{bail, Result};
+use anyhow::{Context, Result};
 use clap::Parser;
+use config::ProviderKind;
+use modes::local_upload::UploadOptions;
+use modes::remote_urls::{MirrorOptions, UrlList, DEFAULT_ASSET_FILTER};
+use modes::Stats;
+use regex::Regex;
+use std::io::IsTerminal;
 use std::path::PathBuf;
-use tracing::{error, info, warn, Level};
-use tracing_subscriber::FmtSubscriber;
+use std::process::ExitCode;
+use tracing::{debug, error, info, warn};
+use tracing_subscriber::EnvFilter;
+
+const EXIT_FATAL: u8 = 1;
+const EXIT_PARTIAL: u8 = 3;
+const EXIT_INTERRUPTED: u8 = 130;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "cloud-uploader",
-    author = "Cloud Uploader Team",
     version,
-    about = "Universal cloud backup and release mirror utility (Yandex, Mail.ru, Google Drive, WebDAV, S3)",
-    long_about = "Securely uploads local files/folders to cloud storage or synchronizes GitHub releases from a remote urls.txt list.\n\nCredentials are NEVER passed via CLI arguments; configure them in a .env file or system environment variables for security."
+    about = "Uploads backups to cloud storage and mirrors GitHub releases (Yandex Disk, Mail.ru, Google Drive, WebDAV, S3)",
+    long_about = "Uploads a local file or directory to cloud storage, skipping files that are already \
+up to date. Without LOCAL_PATH, mirrors the URLs listed in urls.txt (GitHub repositories are resolved \
+to their latest release assets).\n\nCredentials are never passed on the command line: put them into a \
+.env file or environment variables (see --list-providers).",
+    after_help = "Exit codes: 0 success, 1 fatal error, 2 invalid arguments, 3 finished with failed files, 130 interrupted."
 )]
 struct Cli {
-    /// Local file or directory to upload. If omitted, runs remote URLs mirror mode using urls.txt from cloud
+    /// Local file or directory to upload. If omitted, mirrors URLs from urls.txt
     #[arg(value_name = "LOCAL_PATH")]
     local_path: Option<PathBuf>,
 
-    /// Cloud provider: yandex, mailru, google, webdav, s3
+    /// Cloud provider
     #[arg(
-        short = 'p',
-        long = "provider",
+        short,
+        long,
         env = "CLOUD_PROVIDER",
-        default_value = "yandex",
-        value_parser = ["yandex", "mailru", "google", "webdav", "s3"]
+        value_enum,
+        ignore_case = true,
+        default_value = "yandex"
     )]
-    provider: String,
+    provider: ProviderKind,
 
-    /// Show list of supported cloud providers and their required .env variables
-    #[arg(long = "list-providers", default_value_t = false)]
-    list_providers: bool,
-
-    /// Remote target directory in cloud (e.g. /Upload or /Backups/2026.09.17)
-    #[arg(
-        short = 'r',
-        long = "remote",
-        env = "CLOUD_REMOTE_DIR",
-        default_value = "/Upload"
-    )]
+    /// Target folder in the cloud
+    #[arg(short, long, env = "CLOUD_REMOTE_DIR", default_value = "/Upload")]
     remote: String,
 
-    /// Custom path to .env file
-    #[arg(long = "env-file", value_name = "FILE")]
+    /// Path to a .env file (default: ./.env, then .env next to the executable)
+    #[arg(long, value_name = "FILE")]
     env_file: Option<PathBuf>,
 
-    /// Custom path to urls.txt (local file or cloud path). If omitted, checks local urls.txt before cloud
-    #[arg(long = "urls-file", value_name = "PATH")]
+    /// URL list: a local file or a cloud path [default: ./urls.txt, <exe dir>/urls.txt, <remote>/urls.txt, /urls.txt]
+    #[arg(long, value_name = "PATH", env = "CLOUD_URLS_FILE")]
     urls_file: Option<PathBuf>,
 
-    /// Clean (empty) target remote folder in the cloud before uploading
-    #[arg(
-        short = 'c',
-        long = "clean",
-        alias = "clean-remote",
-        default_value_t = false
-    )]
-    clean_remote: bool,
+    /// Delete everything in the target folder before uploading (keeps a cloud urls.txt)
+    #[arg(short = 'c', long = "clean", alias = "clean-remote")]
+    clean: bool,
 
-    /// Force overwrite existing remote files even if size or MD5 match
-    #[arg(short = 'f', long = "overwrite", default_value_t = false)]
+    /// Upload even if the remote file looks identical
+    #[arg(short = 'f', long)]
     overwrite: bool,
 
-    /// Enable verbose / debug logging
-    #[arg(short = 'v', long = "verbose", default_value_t = false)]
+    /// Show what would be uploaded or deleted without changing anything
+    #[arg(short = 'n', long)]
+    dry_run: bool,
+
+    /// Number of files uploaded in parallel (local upload mode)
+    #[arg(short, long, env = "CLOUD_JOBS", default_value_t = 2,
+          value_parser = clap::value_parser!(u16).range(1..=32))]
+    jobs: u16,
+
+    /// Regex selecting which GitHub release assets to mirror
+    #[arg(long, value_name = "REGEX", env = "CLOUD_ASSET_FILTER", default_value = DEFAULT_ASSET_FILTER)]
+    assets: String,
+
+    /// List supported providers and their configuration variables
+    #[arg(long)]
+    list_providers: bool,
+
+    /// Verbose (debug) output
+    #[arg(short, long, conflicts_with = "quiet")]
     verbose: bool,
+
+    /// Only print warnings and errors
+    #[arg(short, long)]
+    quiet: bool,
 }
 
-#[cfg(windows)]
-#[allow(clippy::upper_case_acronyms)]
-fn init_ansi_support() -> bool {
-    if std::env::var_os("NO_COLOR").is_some() {
-        return false;
+enum Mode {
+    Upload(PathBuf),
+    Mirror(UrlList),
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    // Load .env before parsing so it can provide defaults (CLOUD_PROVIDER, ...).
+    let env_loaded = config::load_environment(config::env_file_from_args().as_deref());
+    let cli = Cli::parse();
+
+    if cli.list_providers {
+        config::print_providers();
+        return ExitCode::SUCCESS;
+    }
+    init_logging(cli.verbose, cli.quiet);
+
+    match env_loaded {
+        Ok(Some(path)) => debug!("Loaded environment from {}", path.display()),
+        Ok(None) => debug!("No .env file found, using environment variables only"),
+        Err(err) => {
+            error!("{err:#}");
+            return ExitCode::from(EXIT_FATAL);
+        }
     }
 
-    unsafe {
-        use std::os::raw::c_void;
-        type HANDLE = *mut c_void;
-        type DWORD = u32;
-        type BOOL = i32;
-
-        const STD_OUTPUT_HANDLE: DWORD = -11i32 as DWORD;
-        const ENABLE_VIRTUAL_TERMINAL_PROCESSING: DWORD = 0x0004;
-
-        extern "system" {
-            fn GetStdHandle(nStdHandle: DWORD) -> HANDLE;
-            fn GetConsoleMode(hConsoleHandle: HANDLE, lpMode: *mut DWORD) -> BOOL;
-            fn SetConsoleMode(hConsoleHandle: HANDLE, dwMode: DWORD) -> BOOL;
+    let result = tokio::select! {
+        result = run(&cli) => result,
+        _ = tokio::signal::ctrl_c() => {
+            warn!("Interrupted");
+            return ExitCode::from(EXIT_INTERRUPTED);
         }
+    };
 
-        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
-        if handle.is_null() || handle == (-1isize as *mut c_void) {
-            return false;
+    match result {
+        Ok(stats) if stats.failed == 0 => {
+            info!(
+                "Done{}",
+                if cli.dry_run {
+                    " (dry run, nothing was changed)"
+                } else {
+                    ""
+                }
+            );
+            ExitCode::SUCCESS
         }
-
-        let mut mode: DWORD = 0;
-        if GetConsoleMode(handle, &mut mode) == 0 {
-            return false;
+        Ok(stats) => {
+            error!("Finished with {} failure(s)", stats.failed);
+            ExitCode::from(EXIT_PARTIAL)
         }
-
-        if (mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0 {
-            return true;
+        Err(err) => {
+            error!("{err:#}");
+            ExitCode::from(EXIT_FATAL)
         }
-
-        mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-        SetConsoleMode(handle, mode) != 0
     }
 }
 
-#[cfg(not(windows))]
-fn init_ansi_support() -> bool {
-    std::env::var_os("NO_COLOR").is_none()
+async fn run(cli: &Cli) -> Result<Stats> {
+    let remote_dir = utils::path::normalize_remote_dir(&cli.remote);
+    let asset_filter = Regex::new(&cli.assets).context("Invalid --assets regular expression")?;
+    let provider = config::init_provider(cli.provider)?;
+
+    info!(
+        "cloud-uploader v{} | {} | target folder '{remote_dir}'{}",
+        env!("CARGO_PKG_VERSION"),
+        provider.name(),
+        if cli.dry_run { " | DRY RUN" } else { "" }
+    );
+
+    // Everything that can fail is validated before anything is deleted.
+    let mode = match &cli.local_path {
+        Some(path) => {
+            std::fs::metadata(path)
+                .with_context(|| format!("Local path '{}' is not accessible", path.display()))?;
+            Mode::Upload(path.clone())
+        }
+        None => Mode::Mirror(
+            modes::remote_urls::load_url_list(&*provider, &remote_dir, cli.urls_file.as_deref())
+                .await?,
+        ),
+    };
+
+    let access = if cli.dry_run {
+        provider.list_dir(&remote_dir).await.map(drop)
+    } else {
+        provider.check_access(&remote_dir).await
+    };
+    access.with_context(|| {
+        format!(
+            "Cannot access '{remote_dir}' on {}; check credentials and network",
+            provider.name()
+        )
+    })?;
+
+    let mut stats = Stats::default();
+    if cli.clean {
+        let keep: Vec<String> = match &mode {
+            Mode::Mirror(list) => list.remote_path().map(str::to_string).into_iter().collect(),
+            Mode::Upload(_) => Vec::new(),
+        };
+        stats.merge(
+            modes::clean::clean_remote_dir(&*provider, &remote_dir, &keep, cli.dry_run).await?,
+        );
+    }
+
+    match mode {
+        Mode::Upload(path) => {
+            let opts = UploadOptions {
+                overwrite: cli.overwrite || cli.clean,
+                dry_run: cli.dry_run,
+                jobs: usize::from(cli.jobs),
+            };
+            stats.merge(
+                modes::local_upload::run_local_upload(&*provider, &path, &remote_dir, &opts)
+                    .await?,
+            );
+        }
+        Mode::Mirror(list) => {
+            let opts = MirrorOptions {
+                dry_run: cli.dry_run,
+                asset_filter,
+            };
+            stats.merge(
+                modes::remote_urls::run_remote_urls(&*provider, &remote_dir, &list, &opts).await?,
+            );
+        }
+    }
+    Ok(stats)
 }
 
-struct CompactLocalTimer;
+fn init_logging(verbose: bool, quiet: bool) {
+    let level = match (verbose, quiet) {
+        (true, _) => "debug",
+        (_, true) => "warn",
+        _ => "info",
+    };
+    // CLOUD_UPLOADER_LOG accepts tracing filter syntax, e.g. "debug,reqwest=trace".
+    let filter = EnvFilter::try_from_env("CLOUD_UPLOADER_LOG")
+        .unwrap_or_else(|_| EnvFilter::new(format!("warn,cloud_uploader={level}")));
 
-impl tracing_subscriber::fmt::time::FormatTime for CompactLocalTimer {
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_timer(LocalTimer)
+        .with_ansi(use_ansi())
+        .init();
+}
+
+struct LocalTimer;
+
+impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
     fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
         write!(w, "{}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    if cli.list_providers {
-        println!("Supported cloud providers (-p, --provider):");
-        println!("  - yandex   : Yandex.Disk (REST API OAuth)");
-        println!("               Required env: YANDEX_TOKEN");
-        println!();
-        println!("  - mailru   : Mail.ru Cloud (WebDAV: webdav.mail.ru)");
-        println!("               Required env: MAILRU_USER, MAILRU_PASSWORD");
-        println!();
-        println!("  - google   : Google Drive (v3 API)");
-        println!("               Required env: GOOGLE_DRIVE_TOKEN");
-        println!();
-        println!("  - webdav   : Universal WebDAV (Nextcloud, ownCloud, pCloud, NAS)");
-        println!("               Required env: WEBDAV_URL, WEBDAV_USER, WEBDAV_PASSWORD");
-        println!();
-        println!("  - s3       : S3 Compatible / Cloudflare R2 / MinIO / Yandex Object Storage");
-        println!("               Required env: S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY (optional: S3_REGION)");
-        println!();
-        println!("Note: All credentials can be placed in .env file next to the binary or current folder.");
-        return Ok(());
-    }
-
-    // 1. Setup logging
-    FmtSubscriber::builder()
-        .with_max_level(if cli.verbose {
-            Level::DEBUG
-        } else {
-            Level::INFO
-        })
-        .with_target(false)
-        .with_timer(CompactLocalTimer)
-        .with_ansi(init_ansi_support())
-        .init();
-
-    info!("=== Cloud Uploader v{} ===", env!("CARGO_PKG_VERSION"));
-
-    // 2. Load .env environment
-    if let Err(e) = config::load_environment(cli.env_file.as_deref()) {
-        bail!("Environment loading error: {}", e);
-    }
-
-    // Clean remote path safely resolving any .. segments
-    let remote_dir = crate::utils::path::normalize_remote_dir(&cli.remote);
-    let remote_dir = if remote_dir == "/" {
-        "/Upload".to_string()
-    } else {
-        remote_dir
-    };
-
-    // 3. Initialize cloud provider
-    let provider = match config::init_provider(&cli.provider) {
-        Ok(p) => p,
-        Err(e) => {
-            error!("ERROR: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    info!("Selected provider:   {}", provider.name());
-    info!("Target cloud folder: {}", remote_dir);
-
-    // 4. Ensure target folder exists - FAIL FAST if unauthorized or invalid
-    if let Err(err) = provider.ensure_dir(&remote_dir).await {
-        bail!(
-            "Failed to access or create target remote directory '{}': {}\nPlease verify your credentials and network connectivity.",
-            remote_dir,
-            err
-        );
-    }
-
-    // Optional: Clean remote target folder if requested
-    if cli.clean_remote {
-        clean_remote_dir(&*provider, &remote_dir).await?;
-    }
-
-    // 5. Dispatch mode
-    if let Some(ref local_path) = cli.local_path {
-        // Mode 1: Local upload mode
-        modes::local_upload::run_local_upload(&*provider, local_path, &remote_dir, cli.overwrite)
-            .await?;
-    } else {
-        // Mode 2: Remote URLs mirror mode
-        modes::remote_urls::run_remote_urls(&*provider, &remote_dir, cli.urls_file.as_deref())
-            .await?;
-    }
-
-    Ok(())
+/// Colors only for interactive terminals, never in log files; honors NO_COLOR.
+fn use_ansi() -> bool {
+    std::env::var_os("NO_COLOR").is_none()
+        && std::io::stdout().is_terminal()
+        && enable_virtual_terminal()
 }
 
-async fn clean_remote_dir(provider: &dyn storage::StorageProvider, remote_dir: &str) -> Result<()> {
-    let clean_path = remote_dir.trim().trim_end_matches('/');
-    if clean_path.is_empty() || clean_path == "/" {
-        bail!("Refusing to clean root directory '/' for safety! Specify a target subfolder (e.g. -r /Upload).");
+#[cfg(windows)]
+fn enable_virtual_terminal() -> bool {
+    use std::os::raw::c_void;
+    type Handle = *mut c_void;
+
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+
+    extern "system" {
+        fn GetStdHandle(std_handle: u32) -> Handle;
+        fn GetConsoleMode(console: Handle, mode: *mut u32) -> i32;
+        fn SetConsoleMode(console: Handle, mode: u32) -> i32;
     }
 
-    info!(
-        "Cleaning target remote directory '{}' before operation...",
-        clean_path
-    );
-    let items = match provider.list_dir(clean_path).await {
-        Ok(i) => i,
-        Err(e) => {
-            warn!(
-                "Failed to list items for cleaning in '{}': {}",
-                clean_path, e
-            );
-            return Ok(());
+    // SAFETY: plain Win32 console calls on this process's own stdout handle.
+    unsafe {
+        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        if handle.is_null() || handle == (-1isize as Handle) {
+            return false;
         }
-    };
-
-    if items.is_empty() {
-        info!("Remote directory '{}' is already empty.", clean_path);
-        return Ok(());
-    }
-
-    let mut deleted_count = 0;
-    for item in items {
-        info!("  [-] Deleting remote: {}", item.path);
-        if let Err(e) = provider.delete_file(&item.path).await {
-            warn!("  [!] Failed to delete '{}': {}", item.path, e);
-        } else {
-            deleted_count += 1;
+        let mut mode = 0u32;
+        if GetConsoleMode(handle, &mut mode) == 0 {
+            return false;
         }
+        mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0
+            || SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0
+    }
+}
+
+#[cfg(not(windows))]
+fn enable_virtual_terminal() -> bool {
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
     }
 
-    info!(
-        "[OK] Cleaned {} item(s) from '{}'.",
-        deleted_count, clean_path
-    );
-    Ok(())
+    #[test]
+    fn provider_aliases_are_accepted() {
+        let cli = Cli::try_parse_from(["x", "-p", "GDrive", "-j", "4", "dir"]).unwrap();
+        assert_eq!(cli.provider, ProviderKind::Google);
+        assert_eq!(cli.jobs, 4);
+        assert!(Cli::try_parse_from(["x", "-j", "0"]).is_err());
+    }
 }

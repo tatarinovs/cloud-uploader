@@ -1,14 +1,15 @@
 [package]
 name = "cloud-uploader"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
+rust-version = "1.80"
 authors = ["Cloud Uploader Team"]
 description = "Universal cloud backup and release mirror utility"
 
 [dependencies]
-tokio = { version = "1.38", features = ["macros", "rt-multi-thread", "fs", "io-util", "time"] }
-tokio-util = { version = "0.7", features = ["io"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "multipart"] }
+tokio = { version = "1.38", features = ["macros", "rt-multi-thread", "fs", "io-util", "time", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+bytes = "1"
 clap = { version = "4.5", features = ["derive", "env"] }
 dotenvy = "0.15"
 async-trait = "0.1"
@@ -21,14 +22,13 @@ hmac = "0.12"
 hex = "0.4"
 walkdir = "2.5"
 url = "2.5"
+percent-encoding = "2.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
 regex = "1.10"
 futures-util = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
-
-[dev-dependencies]
 tempfile = "3"
 
 [profile.release]
